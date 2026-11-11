@@ -1,0 +1,427 @@
+
+// =============================================================================
+// CurseForge dependency manager  (applied from build.gradle)
+//
+//   mods.txt   what you want  -> edit by hand, or let ./gradlew addMod edit it
+//   mods.lock  what you got   -> written by ./gradlew updateMods (commit it)
+//
+// Tasks (group "mods"):
+//   searchMod -Pq="epic fight"         search CurseForge for this Minecraft version + loader
+//   addMod    -Pmod=<id|slug|name>     add a project to mods.txt and pin its newest file
+//   modFiles  -Pmod=<id|slug>          list recent files, so you can pin one with -Pbuildid=<fileId>
+//   updateMods                         re-resolve the newest file of every unpinned entry
+//
+// CurseForge API key (needed for every lookup; pinned entries need none):
+//   put   curseforge_api_key=YOUR_KEY   in  ~/.gradle/gradle.properties   (NOT in this project)
+//   or set the CURSEFORGE_API_KEY environment variable.
+//
+// Optional gradle.properties settings:
+//   curse_loader_type=1            1 = Forge (default), 6 = NeoForge
+//   curse_allow_prerelease=true    take the newest file even if it is a beta/alpha
+// =============================================================================
+
+import groovy.json.JsonSlurper
+
+// Reads a -P option / gradle.properties value, but only if it is plain text. A task or extension
+// that happens to share the name (e.g. the build task) is ignored instead of being returned.
+def prop = { String name ->
+    def v = project.findProperty(name)
+    (v instanceof CharSequence && v.toString().trim()) ? v.toString().trim() : null
+}
+
+def cfBase    = (System.getenv('CURSEFORGE_API_BASE') ?: prop('curseforge_api_base') ?: 'https://api.curseforge.com/v1').toString().replaceAll('/+$', '')
+def cfLoader  = (prop('curse_loader_type') ?: '1')
+def mcVersion = prop('minecraft_version')
+def allowPre  = (prop('curse_allow_prerelease') ?: 'false').toBoolean()
+def modsFile  = file('mods.txt')
+def lockFile  = file('mods.lock')
+def SCOPES    = ['implementation', 'compileOnly', 'runtimeOnly']
+def RELEASE   = [1: 'release', 2: 'beta', 3: 'alpha']
+
+def NO_KEY_HELP = '''[mods] No CurseForge API key found, so newest versions cannot be looked up.
+       Add this line to ~/.gradle/gradle.properties (not to the project):
+           curseforge_api_key=YOUR_KEY
+       (or set the CURSEFORGE_API_KEY environment variable), then run: ./gradlew updateMods
+       Entries with a pinned file id ("<project> <fileId>" in mods.txt) work without a key.'''
+
+def apiKey = {
+    (System.getenv('CURSEFORGE_API_KEY') ?: prop('curseforge_api_key'))?.toString()?.trim()
+}
+
+def requireKey = {
+    if (!apiKey()) {
+        throw new GradleException(NO_KEY_HELP)
+    }
+    if (!mcVersion) {
+        throw new GradleException('[mods] minecraft_version is missing from gradle.properties')
+    }
+}
+
+// ---------------------------------------------------------------- HTTP ------
+def cfGet = { String path, Map query = [:] ->
+    def qs = query.findAll { k, v -> v != null && v.toString() != '' }
+            .collect { k, v -> k + '=' + URLEncoder.encode(v.toString(), 'UTF-8') }
+            .join('&')
+    def conn = (HttpURLConnection) new URL(cfBase + path + (qs ? '?' + qs : '')).openConnection()
+    conn.connectTimeout = 10000
+    conn.readTimeout = 20000
+    conn.setRequestProperty('x-api-key', apiKey())
+    conn.setRequestProperty('Accept', 'application/json')
+    conn.setRequestProperty('User-Agent', 'curse-deps-gradle')
+    int code
+    String body
+    try {
+        code = conn.responseCode
+        def stream = code >= 400 ? conn.errorStream : conn.inputStream
+        body = stream != null ? stream.getText('UTF-8') : ''
+    } catch (IOException e) {
+        throw new GradleException("could not reach CurseForge (${e.message})")
+    }
+    if (code == 401 || code == 403) {
+        throw new GradleException("CurseForge rejected the API key (HTTP ${code}) - check curseforge_api_key")
+    }
+    if (code == 404) {
+        throw new GradleException("not found on CurseForge (${path})")
+    }
+    if (code >= 400) {
+        throw new GradleException("CurseForge API error HTTP ${code} for ${path}")
+    }
+    new JsonSlurper().parseText(body)
+}
+
+// ------------------------------------------------------------- parsing ------
+// <project> is a CurseForge project id (405076), slug-id (epic-fight-mod-405076) or a plain slug.
+// The id part needs 4+ digits so slugs like "applied-energistics-2" stay slugs.
+def parseRef = { String ref ->
+    def m = (ref =~ /^(?:([A-Za-z0-9._-]+?)-)?(\d{4,})$/)
+    if (m.matches()) {
+        return [projectId: m.group(2), slug: m.group(1)]
+    }
+    if (ref ==~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) {
+        return [slug: ref]
+    }
+    return null
+}
+
+def stripComment = { String raw ->
+    int hash = raw.indexOf('#')
+    (hash >= 0 ? raw.substring(0, hash) : raw).trim()
+}
+
+// mods.txt line:  [scope] <project> [fileId]
+def parseMods = {
+    def entries = []
+    if (!modsFile.exists()) {
+        return entries
+    }
+    modsFile.readLines('UTF-8').eachWithIndex { raw, idx ->
+        def line = stripComment(raw)
+        if (!line) {
+            return
+        }
+        def tokens = line.split(/\s+/).toList()
+        def scope = 'implementation'
+        if (SCOPES.contains(tokens[0])) {
+            scope = tokens.remove(0)
+        }
+        def ref = (tokens.size() in [1, 2]) ? parseRef(tokens[0]) : null
+        def pin = tokens.size() == 2 ? tokens[1] : null
+        if (ref == null || (pin != null && !(pin ==~ /\d+/))) {
+            logger.warn("[mods] mods.txt line ${idx + 1} ignored (expected: [scope] <project> [fileId]): ${line}")
+            return
+        }
+        entries << [scope: scope, ref: tokens[0], projectId: ref.projectId, slug: ref.slug, pin: pin, line: idx]
+    }
+    entries
+}
+
+// mods.lock line:  <projectId> <slug> <fileId>   # note
+def parseLock = {
+    def byId = [:]
+    def bySlug = [:]
+    if (lockFile.exists()) {
+        lockFile.readLines('UTF-8').each { raw ->
+            def line = stripComment(raw)
+            if (!line) {
+                return
+            }
+            def t = line.split(/\s+/)
+            if (t.length >= 3 && t[0] ==~ /\d+/ && t[2] ==~ /\d+/) {
+                def e = [projectId: t[0], slug: t[1], fileId: t[2]]
+                byId[e.projectId] = e
+                bySlug[e.slug] = e
+            }
+        }
+    }
+    [byId: byId, bySlug: bySlug]
+}
+
+// ---------------------------------------------- dependencies for build.gradle
+// build.gradle does:  curseMods.each { m -> add(m.scope, fg.deobf(m.coordinates)) }
+def assemble = {
+    def lock = parseLock()
+    def result = []
+    parseMods().each { e ->
+        def hit = e.projectId ? lock.byId[e.projectId] : lock.bySlug[e.slug]
+        def projectId = e.projectId ?: hit?.projectId
+        def fileId = e.pin ?: hit?.fileId
+        def slug = e.slug ?: hit?.slug ?: 'mod'
+        if (!projectId || !fileId) {
+            logger.warn("[mods] '${e.ref}' has no resolved file yet - run: ./gradlew updateMods")
+            return
+        }
+        result << [scope: e.scope, coordinates: "curse.maven:${slug}-${projectId}:${fileId}".toString()]
+    }
+    result
+}
+project.ext.curseMods = assemble()
+
+// ------------------------------------------------------ CurseForge lookups --
+def fileList = { projectId ->
+    def all = []
+    int index = 0
+    int total = Integer.MAX_VALUE
+    int pages = 0
+    while (index < total && pages < 10) {
+        def r = cfGet("/mods/${projectId}/files".toString(),
+                [gameVersion: mcVersion, modLoaderType: cfLoader, pageSize: 50, index: index])
+        def data = r.data ?: []
+        if (data.isEmpty()) {
+            break
+        }
+        all.addAll(data)
+        index += data.size()
+        total = (r.pagination?.totalCount ?: data.size()) as int
+        pages++
+    }
+    all
+}
+
+// Newest release wins; a beta/alpha is only used when nothing else exists
+// (or always, with curse_allow_prerelease=true).
+def pickLatest = { List files ->
+    def usable = files.findAll { it.isAvailable != false }
+    if (usable.isEmpty()) {
+        return null
+    }
+    usable.sort(false) { a, b ->
+        def ra = allowPre ? 0 : (a.releaseType ?: 1)
+        def rb = allowPre ? 0 : (b.releaseType ?: 1)
+        (ra <=> rb) ?: ((b.fileDate ?: '') <=> (a.fileDate ?: ''))
+    }.first()
+}
+
+def getMod = { projectId -> cfGet("/mods/${projectId}".toString()).data }
+
+def findBySlug = { String slug ->
+    (cfGet('/mods/search', [gameId: 432, classId: 6, slug: slug]).data ?: []).find { it.slug == slug }
+}
+
+def searchMods = { String text, boolean filtered ->
+    def q = [gameId: 432, classId: 6, searchFilter: text, sortField: 2, sortOrder: 'desc', pageSize: 15]
+    if (filtered) {
+        q.gameVersion = mcVersion
+        q.modLoaderType = cfLoader
+    }
+    cfGet('/mods/search', q).data ?: []
+}
+
+def normalize = { it.toString().toLowerCase().replaceAll('[^a-z0-9]', '') }
+def shorten = { s, int n -> s == null ? '' : (s.length() > n ? s.substring(0, n - 1) + '~' : s) }
+
+def printResults = { List mods ->
+    if (mods.isEmpty()) {
+        logger.lifecycle('  (no results)')
+        return
+    }
+    logger.lifecycle(String.format('  %-9s %-34s %-34s %s', 'ID', 'SLUG', 'NAME', 'DOWNLOADS'))
+    mods.each { m ->
+        logger.lifecycle(String.format('  %-9s %-34s %-34s %,d', m.id, shorten(m.slug, 34), shorten(m.name, 34),
+                ((m.downloadCount ?: 0) as long)))
+    }
+}
+
+// Project id / slug-id / slug / free text  ->  one CurseForge project (or an error listing candidates)
+def resolveInput = { String input ->
+    def ref = parseRef(input)
+    if (ref?.projectId) {
+        return getMod(ref.projectId)
+    }
+    if (ref?.slug) {
+        def hit = findBySlug(ref.slug)
+        if (hit) {
+            return hit
+        }
+    }
+    def results = searchMods(input, true)
+    def n = normalize(input)
+    def exact = results.findAll { normalize(it.name) == n || normalize(it.slug) == n }
+    if (exact.size() == 1) {
+        return exact[0]
+    }
+    if (results.size() == 1) {
+        return results[0]
+    }
+    if (results.isEmpty()) {
+        throw new GradleException("[mods] nothing found for '${input}' (Minecraft ${mcVersion}). Try: ./gradlew searchMod -Pq=\"${input}\" -Pany=true")
+    }
+    printResults(results)
+    throw new GradleException("[mods] '${input}' matches several mods - re-run with -Pmod=<ID> from the list above")
+}
+
+// Resolve every entry of mods.txt and rewrite mods.lock
+def doUpdate = {
+    def entries = parseMods()
+    def old = parseLock()
+    def lines = []
+    int failures = 0
+    entries.each { e ->
+        try {
+            def projectId = e.projectId
+            def slug = e.slug
+            if (!projectId) {
+                def hit = old.bySlug[slug]
+                if (hit) {
+                    projectId = hit.projectId
+                } else {
+                    def mod = findBySlug(slug)
+                    if (!mod) {
+                        throw new GradleException("no CurseForge project with slug '${slug}'")
+                    }
+                    projectId = mod.id.toString()
+                }
+            }
+            if (!slug) {
+                slug = old.byId[projectId]?.slug ?: getMod(projectId).slug
+            }
+            String fileId
+            String note
+            if (e.pin) {
+                fileId = e.pin
+                note = 'pinned'
+            } else {
+                def best = pickLatest(fileList(projectId))
+                if (best == null) {
+                    throw new GradleException("no file for Minecraft ${mcVersion} (loader type ${cfLoader})")
+                }
+                fileId = best.id.toString()
+                note = "${best.fileName} (${RELEASE[best.releaseType] ?: '?'}, ${(best.fileDate ?: '').take(10)})".toString()
+            }
+            def prev = old.byId[projectId]?.fileId
+            lines << "${projectId} ${slug} ${fileId}   # ${note}".toString()
+            def change = prev == null ? "-> ${fileId}  ${note}" : (prev == fileId ? "${fileId} (unchanged)" : "${prev} -> ${fileId}  ${note}")
+            logger.lifecycle(String.format('  %-34s %s', slug, change))
+        } catch (GradleException ex) {
+            failures++
+            logger.error("  ${e.ref}: ${ex.message}")
+            def keep = e.projectId ? old.byId[e.projectId] : old.bySlug[e.slug]
+            if (keep) {
+                lines << "${keep.projectId} ${keep.slug} ${keep.fileId}   # kept - update failed".toString()
+            }
+        }
+    }
+    def header = '# Generated by ./gradlew updateMods - commit this file, edit mods.txt instead.\n' +
+            '# <projectId> <slug> <fileId>   # file name (release type, date)\n'
+    lockFile.setText(header + lines.join('\n') + (lines ? '\n' : ''), 'UTF-8')
+    logger.lifecycle(failures == 0
+            ? '[mods] mods.lock updated. Reload the Gradle project so IntelliJ picks it up.'
+            : "[mods] mods.lock updated with ${failures} problem(s) above. Reload the Gradle project afterwards.")
+}
+
+// ---------------------------------------------------------------- tasks -----
+tasks.register('updateMods') {
+    group = 'mods'
+    description = 'Look up the newest CurseForge file of every unpinned entry in mods.txt and write mods.lock'
+    doLast {
+        if (parseMods().isEmpty()) {
+            logger.lifecycle('[mods] mods.txt has no entries - nothing to do.')
+            return
+        }
+        if (!apiKey() || !mcVersion) {
+            logger.warn(NO_KEY_HELP)   // no failure: project creation must not break without a key
+            return
+        }
+        doUpdate()
+    }
+}
+
+tasks.register('searchMod') {
+    group = 'mods'
+    description = 'Search CurseForge: ./gradlew searchMod -Pq="epic fight"   (-Pany=true ignores the MC version/loader filter)'
+    doLast {
+        def q = prop('q')
+        if (!q) {
+            throw new GradleException('Usage: ./gradlew searchMod -Pq="<text>"')
+        }
+        requireKey()
+        def filtered = !(prop('any')?.toBoolean())
+        logger.lifecycle("[mods] '${q}' for Minecraft ${mcVersion}${filtered ? '' : ' (any version)'}:")
+        printResults(searchMods(q, filtered))
+        logger.lifecycle('[mods] add one with: ./gradlew addMod -Pmod=<ID>')
+    }
+}
+
+tasks.register('addMod') {
+    group = 'mods'
+    description = 'Add a project to mods.txt and pin its newest file: ./gradlew addMod -Pmod=<id|slug|name> [-Pscope=compileOnly] [-Pbuildid=<fileId>]'
+    doLast {
+        def input = prop('mod')
+        if (!input) {
+            throw new GradleException('Usage: ./gradlew addMod -Pmod=<id|slug-id|slug|name> [-Pscope=compileOnly] [-Pbuildid=<fileId>]')
+        }
+        requireKey()
+        def scope = (prop('scope') ?: 'implementation')
+        if (!SCOPES.contains(scope)) {
+            throw new GradleException("[mods] -Pscope must be one of ${SCOPES}")
+        }
+        def build = prop('buildid')
+        if (build && !(build ==~ /\d+/)) {
+            throw new GradleException('[mods] -Pbuildid must be a numeric CurseForge file id (see ./gradlew modFiles)')
+        }
+        def mod = resolveInput(input)
+        if (build && !fileList(mod.id).any { it.id.toString() == build }) {
+            throw new GradleException("[mods] file ${build} is not a file of ${mod.name} for Minecraft ${mcVersion} - see: ./gradlew modFiles -Pmod=${mod.id}")
+        }
+        def newLine = (scope == 'implementation' ? '' : scope + ' ') + "${mod.slug}-${mod.id}" +
+                (build ? " ${build}" : '') + "    # ${mod.name}"
+        def existing = parseMods().find { it.projectId == mod.id.toString() || (!it.projectId && it.slug == mod.slug) }
+        def lines = modsFile.exists() ? modsFile.readLines('UTF-8') : []
+        if (existing && build) {
+            lines[existing.line] = newLine.toString()
+            logger.lifecycle("  ${mod.name}: pinned to file ${build}")
+        } else if (existing) {
+            logger.lifecycle("  ${mod.name} is already in mods.txt (line ${existing.line + 1}); use -Pbuildid=<fileId> to pin it")
+        } else {
+            lines << newLine.toString()
+            logger.lifecycle("  added ${mod.name} (${mod.slug}-${mod.id}) to mods.txt")
+        }
+        modsFile.setText(lines.join('\n') + '\n', 'UTF-8')
+        doUpdate()
+    }
+}
+
+tasks.register('modFiles') {
+    group = 'mods'
+    description = 'List recent files of a project: ./gradlew modFiles -Pmod=<id|slug>'
+    doLast {
+        def input = prop('mod')
+        if (!input) {
+            throw new GradleException('Usage: ./gradlew modFiles -Pmod=<id|slug-id|slug|name>')
+        }
+        requireKey()
+        def mod = resolveInput(input)
+        def locked = parseLock().byId[mod.id.toString()]?.fileId
+        def files = fileList(mod.id).findAll { it.isAvailable != false }
+                .sort(false) { a, b -> (b.fileDate ?: '') <=> (a.fileDate ?: '') }
+        logger.lifecycle("[mods] ${mod.name} (${mod.slug}-${mod.id}) - files for Minecraft ${mcVersion}:")
+        files.take(15).each { f ->
+            logger.lifecycle(String.format('  %-9s %-8s %-11s %s%s', f.id, RELEASE[f.releaseType] ?: '?',
+                    (f.fileDate ?: '').take(10), f.fileName, f.id.toString() == locked ? '   <- locked' : ''))
+        }
+        if (files.isEmpty()) {
+            logger.lifecycle('  (no files)')
+        }
+        logger.lifecycle("[mods] pin one with: ./gradlew addMod -Pmod=${mod.id} -Pbuildid=<fileId>")
+    }
+}
+

@@ -1,0 +1,24 @@
+
+# CurseForge mods for this project. Resolved by gradle/curse-deps.gradle into mods.lock.
+#
+# One mod per line:   [scope] <project> [fileId]
+#   scope    implementation (default) | compileOnly | runtimeOnly
+#   project  CurseForge project ID (405076), slug-ID (epic-fight-mod-405076) or slug (epic-fight-mod)
+#   fileId   optional: pin an exact file. Without it the newest release for this
+#            Minecraft version + Forge is picked by ./gradlew updateMods.
+#
+# Handy tasks (needs a CurseForge API key, see gradle/curse-deps.gradle):
+#   ./gradlew searchMod -Pq="epic fight"
+#   ./gradlew addMod -Pmod=405076 [-Pscope=compileOnly] [-Pbuildid=<fileId>]
+#   ./gradlew modFiles -Pmod=405076
+#   ./gradlew updateMods
+# After any of them, reload the Gradle project in IntelliJ.
+#
+
+implementation epic-fight-invincible-1184379
+implementation sword-soaring-1011068
+implementation icarus-428151
+implementation resourceful-config-714059
+implementation common-network-806044
+implementation caelus-308989
+implementation curios-309927

@@ -1,0 +1,19 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "net.kenji.epicfight_swordsoaringfixes.mixins",
+  "compatibilityLevel": "JAVA_8",
+  "refmap": "epicfight_swordsoaringfixes.refmap.json",
+  "mixins": [
+    "AccessorCamera",
+    "WeaponCapabilityElytraFixMixin"
+  ],
+  "client": [
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "overwrites": {
+    "requireAnnotations": true
+  }
+}
